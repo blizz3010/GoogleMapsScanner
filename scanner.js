@@ -1,184 +1,112 @@
 const { initDb, insertBusinesses, closeDb } = require('./db');
 const { PlacesClient } = require('./places');
+const { PriorityQueue, PRIORITY } = require('./queue');
 
-const DEFAULT_RADIUS = Number(process.env.SCAN_RADIUS_METERS || 1500);
-const DEFAULT_MAX_API_CALLS = Number(process.env.MAX_API_CALLS || 3000);
-const LOOP_FOREVER = String(process.env.CONTINUOUS_SCAN || 'true').toLowerCase() === 'true';
+const SCAN_RADIUS_METERS = 1500;
+const NEIGHBOR_SPACING = 0.01;
 
-const DEFAULT_CATEGORIES = (process.env.SCAN_CATEGORIES ||
-  'restaurant,barbershop,dentist,lawyer,real_estate_agency').split(',').map((x) => x.trim()).filter(Boolean);
+const SEED_LOCATIONS = [
+  { name: 'Downtown Orlando', lat: 28.5383, lng: -81.3792 },
+  { name: 'International Drive', lat: 28.4442, lng: -81.4716 },
+  { name: 'Lake Nona', lat: 28.3852, lng: -81.2428 },
+  { name: 'Winter Park', lat: 28.5999, lng: -81.3392 },
+  { name: 'UCF Area', lat: 28.6024, lng: -81.2001 },
+];
 
-const FLORIDA_BOUNDS = {
-  minLat: Number(process.env.MIN_LAT || 24.396308),
-  maxLat: Number(process.env.MAX_LAT || 31.000888),
-  minLng: Number(process.env.MIN_LNG || -87.634938),
-  maxLng: Number(process.env.MAX_LNG || -79.974307),
-};
-
-const TILE_STEP = Number(process.env.TILE_STEP || 0.05);
-
-function parseNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
+function createNeighbors(point) {
+  return [
+    { lat: point.lat + NEIGHBOR_SPACING, lng: point.lng, source: point.name || point.key, direction: 'north' },
+    { lat: point.lat - NEIGHBOR_SPACING, lng: point.lng, source: point.name || point.key, direction: 'south' },
+    { lat: point.lat, lng: point.lng + NEIGHBOR_SPACING, source: point.name || point.key, direction: 'east' },
+    { lat: point.lat, lng: point.lng - NEIGHBOR_SPACING, source: point.name || point.key, direction: 'west' },
+  ];
 }
 
-function generateTiles({ minLat, maxLat, minLng, maxLng, step }) {
-  const tiles = [];
-  for (let lat = minLat; lat <= maxLat; lat += step) {
-    for (let lng = minLng; lng <= maxLng; lng += step) {
-      tiles.push({ lat: Number(lat.toFixed(6)), lng: Number(lng.toFixed(6)) });
-    }
-  }
-  return tiles;
-}
+async function run() {
+  const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+  const maxApiCalls = Number(process.env.MAX_API_CALLS || 3000);
 
-function enrichLocation(place) {
-  const formatted = place.formatted_address || place.vicinity || '';
-  const parts = formatted.split(',').map((p) => p.trim());
-  const stateMatch = formatted.match(/\b([A-Z]{2})\b/);
-  return {
-    ...place,
-    city: parts.length >= 3 ? parts[parts.length - 3] : null,
-    state: stateMatch ? stateMatch[1] : null,
-    last_seen: new Date().toISOString(),
-  };
-}
+  const placesClient = new PlacesClient({ apiKey, maxCalls: maxApiCalls });
+  const queue = new PriorityQueue();
 
-async function scanTile({ placesClient, tile, radius, categories }) {
-  const seenInTile = new Set();
-  let tileInserted = 0;
-  const perCategory = [];
-
-  for (const category of categories) {
-    if (placesClient.apiCallsUsed >= placesClient.maxCalls) {
-      break;
-    }
-
-    const { results, limitReached } = await placesClient.fetchAllNearbyPages({
-      lat: tile.lat,
-      lng: tile.lng,
-      radius,
-      category,
-    });
-
-    const fresh = [];
-    for (const place of results) {
-      if (!place.place_id || seenInTile.has(place.place_id)) {
-        continue;
-      }
-      seenInTile.add(place.place_id);
-      fresh.push(enrichLocation(place));
-    }
-
-    const { insertedCount } = await insertBusinesses(fresh);
-    tileInserted += insertedCount;
-    perCategory.push({ category, found: results.length, inserted: insertedCount });
-
-    console.log(
-      JSON.stringify({
-        event: 'tile_category_scanned',
-        tile,
-        category,
-        found: results.length,
-        inserted: insertedCount,
-        totalApiCalls: placesClient.apiCallsUsed,
-      })
-    );
-
-    if (limitReached) {
-      break;
-    }
-  }
-
-  return { tile, tileInserted, perCategory };
-}
-
-async function runTileWorker({
-  startLat,
-  startLng,
-  radius = DEFAULT_RADIUS,
-  categories = DEFAULT_CATEGORIES,
-  maxApiCalls = DEFAULT_MAX_API_CALLS,
-  tiles,
-}) {
-  const placesClient = new PlacesClient({
-    apiKey: process.env.GOOGLE_PLACES_API_KEY,
-    maxCalls: maxApiCalls,
-  });
-
-  const tilesToProcess =
-    tiles && tiles.length
-      ? tiles
-      : startLat != null && startLng != null
-        ? [{ lat: startLat, lng: startLng }]
-        : generateTiles({ ...FLORIDA_BOUNDS, step: TILE_STEP });
+  const seenPlaceIds = new Set();
+  let totalStored = 0;
 
   await initDb();
 
-  let totalInserted = 0;
-  let iteration = 0;
+  for (const seed of SEED_LOCATIONS) {
+    queue.enqueue(seed, PRIORITY.HIGH);
+  }
 
-  try {
-    while (LOOP_FOREVER || iteration === 0) {
-      for (const tile of tilesToProcess) {
-        if (placesClient.apiCallsUsed >= placesClient.maxCalls) {
-          console.log('Max API calls reached for worker. Exiting current run.');
-          return { totalInserted, apiCallsUsed: placesClient.apiCallsUsed, iterations: iteration };
-        }
-
-        const result = await scanTile({ placesClient, tile, radius, categories });
-        totalInserted += result.tileInserted;
-
-        console.log(
-          JSON.stringify({
-            event: 'tile_complete',
-            tile: result.tile,
-            tileInserted: result.tileInserted,
-            totalInserted,
-            apiCallsUsed: placesClient.apiCallsUsed,
-          })
-        );
-      }
-
-      iteration += 1;
-      console.log(
-        JSON.stringify({
-          event: 'worker_iteration_complete',
-          iteration,
-          tilesProcessed: tilesToProcess.length,
-          totalInserted,
-          apiCallsUsed: placesClient.apiCallsUsed,
-        })
-      );
-
-      if (!LOOP_FOREVER) {
-        break;
-      }
+  while (queue.size > 0) {
+    const current = queue.dequeue();
+    if (!current) {
+      break;
     }
 
-    return { totalInserted, apiCallsUsed: placesClient.apiCallsUsed, iterations: iteration };
-  } finally {
-    await closeDb();
+    console.log(`Scanning: ${current.name || current.key} (${current.lat}, ${current.lng}) | queue=${queue.size}`);
+
+    try {
+      const { results, limitReached } = await placesClient.fetchAllNearbyPages({
+        lat: current.lat,
+        lng: current.lng,
+        radius: SCAN_RADIUS_METERS,
+      });
+
+      const newResults = [];
+      for (const place of results) {
+        if (place.place_id && !seenPlaceIds.has(place.place_id)) {
+          seenPlaceIds.add(place.place_id);
+          newResults.push(place);
+        }
+      }
+
+      const { insertedCount } = await insertBusinesses(newResults);
+      totalStored += insertedCount;
+
+      console.log(
+        `Found=${results.length}, uniqueNew=${newResults.length}, totalStored=${totalStored}, apiCalls=${placesClient.apiCallsUsed}/${maxApiCalls}`
+      );
+
+      if (limitReached) {
+        console.log('API call limit reached. Stopping scan.');
+        break;
+      }
+
+      if (results.length > 20) {
+        for (const neighbor of createNeighbors(current)) {
+          queue.enqueue(neighbor, PRIORITY.HIGH);
+        }
+      } else if (results.length <= 5) {
+        for (const neighbor of createNeighbors(current)) {
+          queue.enqueue(neighbor, PRIORITY.LOW);
+        }
+      } else {
+        for (const neighbor of createNeighbors(current)) {
+          queue.enqueue(neighbor, PRIORITY.MEDIUM);
+        }
+      }
+    } catch (error) {
+      console.error(`Scan failed at ${current.key}: ${error.message}`);
+      console.error('Continuing with next location...');
+    }
+
+    if (placesClient.apiCallsUsed >= maxApiCalls) {
+      console.log('Max API calls exhausted. Stopping scan.');
+      break;
+    }
   }
+
+  await closeDb();
+  console.log(`Scan complete. Total businesses stored: ${totalStored}. API calls used: ${placesClient.apiCallsUsed}.`);
 }
 
-if (require.main === module) {
-  const cliLat = parseNumber(process.argv[2]);
-  const cliLng = parseNumber(process.argv[3]);
-  const cliRadius = parseNumber(process.argv[4]) || DEFAULT_RADIUS;
-
-  runTileWorker({ startLat: cliLat, startLng: cliLng, radius: cliRadius })
-    .then((summary) => {
-      console.log(JSON.stringify({ event: 'worker_finished', ...summary }));
-    })
-    .catch((error) => {
-      console.error('Fatal scanner error:', error);
-      process.exit(1);
-    });
-}
-
-module.exports = {
-  generateTiles,
-  scanTile,
-  runTileWorker,
-};
+run().catch(async (error) => {
+  console.error('Fatal scanner error:', error);
+  try {
+    await closeDb();
+  } catch (_) {
+    // Ignore close errors.
+  }
+  process.exit(1);
+});

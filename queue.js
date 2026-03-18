@@ -19,10 +19,6 @@ class PriorityQueue {
   }
 
   enqueue(point, priority = PRIORITY.LOW) {
-    if (this.size > 2000) {
-      return false;
-    }
-
     const key = PriorityQueue.keyForPoint(point);
     if (this.seen.has(key)) {
       return false;
@@ -55,40 +51,6 @@ class PriorityQueue {
       this.buckets[PRIORITY.MEDIUM].length +
       this.buckets[PRIORITY.LOW].length
     );
-  }
-
-  dump() {
-    return {
-      buckets: {
-        [PRIORITY.HIGH]: [...this.buckets[PRIORITY.HIGH]],
-        [PRIORITY.MEDIUM]: [...this.buckets[PRIORITY.MEDIUM]],
-        [PRIORITY.LOW]: [...this.buckets[PRIORITY.LOW]],
-      },
-      seen: [...this.seen],
-    };
-  }
-
-  load(snapshot) {
-    if (!snapshot) {
-      return;
-    }
-
-    this.buckets = {
-      [PRIORITY.HIGH]: snapshot.buckets?.[PRIORITY.HIGH] || [],
-      [PRIORITY.MEDIUM]: snapshot.buckets?.[PRIORITY.MEDIUM] || [],
-      [PRIORITY.LOW]: snapshot.buckets?.[PRIORITY.LOW] || [],
-    };
-    this.seen = new Set(snapshot.seen || []);
-  }
-
-  enqueueMany(points, priority = PRIORITY.LOW) {
-    let added = 0;
-    for (const point of points) {
-      if (this.enqueue(point, priority)) {
-        added += 1;
-      }
-    }
-    return added;
   }
 }
 
