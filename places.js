@@ -1,21 +1,16 @@
 const GOOGLE_PLACES_URL = 'https://maps.googleapis.com/maps/api/place/nearbysearch/json';
 
-const MIN_DELAY_MS = 450;
+const MIN_DELAY_MS = 400;
 const MAX_REQUESTS_PER_SECOND = 2;
 const NEXT_PAGE_DELAY_MS = 2000;
 const MAX_RETRIES = 3;
-
-const fetchClient =
-  typeof fetch === 'function'
-    ? fetch
-    : (...args) => import('node-fetch').then(({ default: nodeFetch }) => nodeFetch(...args));
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 class PlacesClient {
-  constructor({ apiKey, maxCalls = 300 }) {
+  constructor({ apiKey, maxCalls = 3000 }) {
     if (!apiKey) {
       throw new Error('Missing GOOGLE_PLACES_API_KEY environment variable');
     }
@@ -69,7 +64,10 @@ class PlacesClient {
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
       try {
-        const response = await fetchClient(url);
+        const response = await fetch(url);
+        this.apiCallsUsed += 1;
+        this.lastRequestAt = Date.now();
+        this.recentRequests.push(this.lastRequestAt);
 
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
@@ -78,8 +76,7 @@ class PlacesClient {
         const data = await response.json();
 
         if (data.status === 'INVALID_REQUEST' && pageToken && attempt < MAX_RETRIES) {
-          const retryDelay = 1000 * (attempt + 1);
-          await sleep(retryDelay);
+          await sleep(1000 * attempt);
           continue;
         }
 
@@ -90,10 +87,6 @@ class PlacesClient {
           }
           throw new Error(`Google Places API error: ${data.status}`);
         }
-
-        this.apiCallsUsed += 1;
-        this.lastRequestAt = Date.now();
-        this.recentRequests.push(this.lastRequestAt);
 
         return {
           results: data.results || [],
@@ -117,25 +110,11 @@ class PlacesClient {
 
     let pageToken = null;
     let hasMore = true;
-    let emptyPageRetryUsed = false;
 
     while (hasMore) {
-      if (this.apiCallsUsed >= this.maxCalls) {
-        return { results: combined, limitReached: true };
-      }
-
       const page = await this.requestNearby({ lat, lng, radius, pageToken });
       if (page.limitReached) {
         return { results: combined, limitReached: true };
-      }
-
-      if (page.results.length === 0 && page.hasMore) {
-        if (!emptyPageRetryUsed) {
-          emptyPageRetryUsed = true;
-          await sleep(NEXT_PAGE_DELAY_MS);
-          continue;
-        }
-        break;
       }
 
       combined.push(...page.results);
